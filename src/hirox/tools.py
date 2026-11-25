@@ -71,11 +71,13 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "run_command",
-            "description": "Execute a shell command in the terminal.",
+            "description": "Execute a shell command in the terminal with timeout and optional retries.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "command": {"type": "string", "description": "Shell command to execute"},
+                    "timeout": {"type": "integer", "description": "Timeout in seconds (default 60, max 300)"},
+                    "retries": {"type": "integer", "description": "Retry count on non-zero exit or timeout (default 0, max 2)"},
                 },
                 "required": ["command"],
             },
@@ -177,20 +179,25 @@ def _tool_write_file(path: str, content: str) -> str:
     return f"Wrote {len(content)} chars to {target}"
 
 
-def _tool_run_command(
+def _run_command_once(
     command: str,
+    timeout_sec: int,
     cancel_event: threading.Event | None = None,
-) -> str:
-    proc = subprocess.Popen(
-        command,
-        shell=True,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        start_new_session=True,
-    )
-    deadline = time.monotonic() + 60.0
+) -> tuple[bool, str]:
+    try:
+        proc = subprocess.Popen(
+            command,
+            shell=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        return False, f"Error: failed to start command: {exc}"
+
+    deadline = time.monotonic() + float(timeout_sec)
     while proc.poll() is None:
         if cancel_event is not None and cancel_event.is_set():
             try:
@@ -198,21 +205,46 @@ def _tool_run_command(
             except OSError:
                 proc.kill()
             proc.wait(timeout=2)
-            return "Cancelled by user (Esc)."
+            return False, "Cancelled by user (Esc)."
         if time.monotonic() > deadline:
             try:
                 os.killpg(proc.pid, signal.SIGKILL)
             except OSError:
                 proc.kill()
             proc.wait(timeout=2)
-            return "Error: command timed out after 60s."
+            return False, f"Error: command timed out after {timeout_sec}s."
         time.sleep(0.05)
 
     out = (proc.stdout.read() if proc.stdout else "") or ""
     out = out.strip()
     if len(out) > 4000:
         out = out[:4000] + "\n...(truncated)"
-    return f"exit_code={proc.returncode}\n{out}" if out else f"exit_code={proc.returncode}"
+    msg = f"exit_code={proc.returncode}\n{out}" if out else f"exit_code={proc.returncode}"
+    return proc.returncode == 0, msg
+
+
+def _tool_run_command(
+    command: str,
+    timeout: int = 60,
+    retries: int = 0,
+    cancel_event: threading.Event | None = None,
+) -> str:
+    if not command.strip():
+        return "Error: empty command."
+    timeout_sec = max(1, min(300, int(timeout)))
+    max_retries = max(0, min(2, int(retries)))
+
+    last_msg = ""
+    for attempt in range(max_retries + 1):
+        ok, msg = _run_command_once(command, timeout_sec, cancel_event=cancel_event)
+        last_msg = msg
+        if ok or msg.startswith("Cancelled by user"):
+            return msg
+        if attempt < max_retries:
+            time.sleep(0.5 * (attempt + 1))
+    if max_retries > 0:
+        return f"{last_msg}\n(failed after {max_retries + 1} attempts)"
+    return last_msg
 
 
 def _tool_web_search(query: str, max_results: int = 5) -> str:
@@ -229,9 +261,17 @@ def _tool_web_search(query: str, max_results: int = 5) -> str:
     }
 
     def _fetch_ddg(url: str) -> str:
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            return resp.read().decode("utf-8", errors="replace")
+        last_exc: Exception | None = None
+        for attempt in range(2):
+            try:
+                req = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    return resp.read().decode("utf-8", errors="replace")
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                last_exc = exc
+                if attempt == 0:
+                    time.sleep(0.5)
+        raise last_exc  # type: ignore[misc]
 
     links: list[tuple[str, str]] = []
     snippets: list[tuple[str, str]] = []
@@ -292,11 +332,22 @@ def _tool_web_fetch(url: str, max_chars: int = 4000) -> str:
         target,
         headers={"User-Agent": "Mozilla/5.0 (compatible; Hirox/0.1)"},
     )
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
-    except Exception as exc:
-        return f"Error: web_fetch failed: {exc}"
+    raw = ""
+    last_exc: Exception | None = None
+    for attempt in range(2):
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+            last_exc = None
+            break
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            last_exc = exc
+            if attempt == 0:
+                time.sleep(0.5)
+        except Exception as exc:
+            return f"Error: web_fetch failed: {exc}"
+    if last_exc is not None:
+        return f"Error: web_fetch failed after retry: {last_exc}"
 
     cleaned = re.sub(r"<(script|style|noscript)[^>]*>.*?</\1>", " ", raw, flags=re.DOTALL | re.IGNORECASE)
     cleaned = re.sub(r"<[^>]+>", " ", cleaned)
@@ -371,44 +422,52 @@ def execute_tool(
     else:
         args = dict(arguments or {})
 
-    if name == "list_dir":
-        return _tool_list_dir(str(args.get("path", ".")))
-    if name == "read_file":
-        return _tool_read_file(
-            path=str(args.get("path", "")),
-            start_line=int(args.get("start_line", 1)),
-            limit=int(args.get("limit", 200)),
-        )
-    if name == "web_search":
-        return _tool_web_search(
-            query=str(args.get("query", "")),
-            max_results=int(args.get("max_results", 5)),
-        )
-    if name == "web_fetch":
-        return _tool_web_fetch(
-            url=str(args.get("url", "")),
-            max_chars=int(args.get("max_chars", 4000)),
-        )
-    if name == "workflow_plan":
-        return _tool_workflow_plan(args)
-
-    if name in ("write_file", "run_command"):
-        if permission_mode == "read_only":
-            return f"Permission denied: '{name}' is blocked in read_only mode."
-        if permission_mode == "ask":
-            desc = (
-                f"run_command: {args.get('command', '')}"
-                if name == "run_command"
-                else f"write_file: {args.get('path', '')}"
-            )
-            if confirm_fn is None or not confirm_fn(desc):
-                return f"Permission denied by user for {name}."
-
-        if name == "write_file":
-            return _tool_write_file(
+    try:
+        if name == "list_dir":
+            return _tool_list_dir(str(args.get("path", ".")))
+        if name == "read_file":
+            return _tool_read_file(
                 path=str(args.get("path", "")),
-                content=str(args.get("content", "")),
+                start_line=int(args.get("start_line", 1)),
+                limit=int(args.get("limit", 200)),
             )
-        return _tool_run_command(str(args.get("command", "")), cancel_event=cancel_event)
+        if name == "web_search":
+            return _tool_web_search(
+                query=str(args.get("query", "")),
+                max_results=int(args.get("max_results", 5)),
+            )
+        if name == "web_fetch":
+            return _tool_web_fetch(
+                url=str(args.get("url", "")),
+                max_chars=int(args.get("max_chars", 4000)),
+            )
+        if name == "workflow_plan":
+            return _tool_workflow_plan(args)
 
-    return f"Error: unknown tool '{name}'"
+        if name in ("write_file", "run_command"):
+            if permission_mode == "read_only":
+                return f"Permission denied: '{name}' is blocked in read_only mode."
+            if permission_mode == "ask":
+                desc = (
+                    f"run_command: {args.get('command', '')}"
+                    if name == "run_command"
+                    else f"write_file: {args.get('path', '')}"
+                )
+                if confirm_fn is None or not confirm_fn(desc):
+                    return f"Permission denied by user for {name}."
+
+            if name == "write_file":
+                return _tool_write_file(
+                    path=str(args.get("path", "")),
+                    content=str(args.get("content", "")),
+                )
+            return _tool_run_command(
+                str(args.get("command", "")),
+                timeout=int(args.get("timeout", 60)),
+                retries=int(args.get("retries", 0)),
+                cancel_event=cancel_event,
+            )
+
+        return f"Error: unknown tool '{name}'"
+    except Exception as exc:
+        return f"Error: {name} failed: {exc}"

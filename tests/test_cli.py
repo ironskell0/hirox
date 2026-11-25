@@ -530,3 +530,51 @@ def test_oauth_pkce_loopback_and_model_discovery(tmp_path: Path, monkeypatch) ->
     monkeypatch.setattr(oauth_mod.urllib.request, "urlopen", lambda *_a, **_kw: _FakeModelsResp())
     models = fetch_provider_models("https://api.openai.com/v1", "tok")
     assert models == ["gpt-5.3-codex", "o3"]
+
+
+def test_tool_error_handling_timeout_and_retries(tmp_path: Path) -> None:
+    from hirox.memory import DEFAULT_SYSTEM_PROMPT
+    from hirox.tools import execute_tool
+
+    # Timeout enforcement
+    res_timeout = execute_tool(
+        "run_command",
+        {"command": "sleep 3", "timeout": 1},
+        permission_mode="full_access",
+    )
+    assert "timed out after 1s" in res_timeout
+
+    # Retry policy: fail on first attempt, succeed on second
+    marker = tmp_path / "retry_ok.txt"
+    cmd = (
+        f"python3 -c \"import pathlib; p=pathlib.Path('{marker}'); "
+        "import sys; "
+        "sys.exit(0) if p.exists() else (p.write_text('1'), sys.exit(1))\""
+    )
+    res_retry = execute_tool(
+        "run_command",
+        {"command": cmd, "retries": 1},
+        permission_mode="full_access",
+    )
+    assert res_retry.startswith("exit_code=0")
+
+    # Retry exhaustion reports attempt count
+    res_fail = execute_tool(
+        "run_command",
+        {"command": "python3 -c 'import sys; sys.exit(2)'", "retries": 1},
+        permission_mode="full_access",
+    )
+    assert "exit_code=2" in res_fail
+    assert "failed after 2 attempts" in res_fail
+
+    # Invalid argument types are caught cleanly
+    res_bad_arg = execute_tool(
+        "read_file",
+        {"path": str(marker), "start_line": "not-an-int"},
+        permission_mode="read_only",
+    )
+    assert res_bad_arg.startswith("Error: read_file failed:")
+
+    # System prompt documents retry & timeout rules
+    assert "Tool Error Handling, Retries & Timeouts:" in DEFAULT_SYSTEM_PROMPT
+
