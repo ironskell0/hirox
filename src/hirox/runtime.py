@@ -3,14 +3,20 @@
 from __future__ import annotations
 
 import signal
+import threading
 import time
 from typing import Any
 
 from hirox.config import load_config
 from hirox.gateway import GatewayRegistry, GatewayStatus, WebhookGateway, build_registry_from_config
 from hirox.memory import build_system_prompt
-from hirox.providers import chat_completion_with_tools
-from hirox.tools import TOOL_SCHEMAS, execute_tool
+from hirox.providers import chat_completion_with_tools, estimate_context_window, estimate_tokens
+from hirox.security import log_security_event, wrap_untrusted_content
+from hirox.tools import PERMISSION_MODES, TOOL_SCHEMAS, execute_tool
+
+MAX_GATEWAY_TOOL_ITERATIONS = 12
+MAX_GATEWAY_TURN_SECONDS = 180.0
+MAX_CONCURRENT_GATEWAY_REQUESTS = 4
 
 
 class HiroxRuntime:
@@ -29,6 +35,7 @@ class HiroxRuntime:
             wh.health_provider = self.get_health_snapshot
             wh.client_tracker = self._clients
         self._running = False
+        self._concurrency_sem = threading.Semaphore(MAX_CONCURRENT_GATEWAY_REQUESTS)
 
     def get_health_snapshot(self) -> dict[str, Any]:
         """Return live health, gateway statuses, and connected chat clients."""
@@ -60,56 +67,104 @@ class HiroxRuntime:
         }
 
     def handle_gateway_message(self, gateway_name: str, sender: str, text: str) -> str:
-        """Route an incoming gateway message through the Hirox AI agent."""
-        ag = self.config.get("agent", {})
-        provider_id = str(ag.get("provider", "openai"))
-        model = str(ag.get("model", "gpt-4o-mini"))
-        language = str(ag.get("language", "en"))
-        provider_cfg = self.config.get("providers", {}).get(provider_id)
-        if not provider_cfg:
-            return f"Error: unknown provider '{provider_id}'."
+        """Route an incoming gateway message through the Hirox AI agent with resource & permission guards."""
+        if not self._concurrency_sem.acquire(timeout=5.0):
+            log_security_event(
+                "concurrency_limit_reached",
+                f"Rejected message from {sender}: too many concurrent requests",
+                gateway=gateway_name,
+                severity="warn",
+            )
+            return "Error: server busy, please retry shortly."
+        try:
+            ag = self.config.get("agent", {})
+            provider_id = str(ag.get("provider", "openai"))
+            model = str(ag.get("model", "gpt-4o-mini"))
+            language = str(ag.get("language", "en"))
+            provider_cfg = self.config.get("providers", {}).get(provider_id)
+            if not provider_cfg:
+                return f"Error: unknown provider '{provider_id}'."
 
-        sys_prompt = build_system_prompt(
-            base_prompt=str(ag.get("system_prompt", "")),
-            gateway=gateway_name,
-            provider_id=provider_id,
-            model=model,
-            permission_mode="read_only",
-            language=language,
-        )
-        messages: list[dict[str, Any]] = [
-            {"role": "system", "content": sys_prompt},
-            {"role": "user", "content": f"[{gateway_name}:{sender}] {text}"},
-        ]
-        while True:
-            msg_obj = chat_completion_with_tools(
-                provider_cfg=provider_cfg,
+            gw_cfg = self.config.get("gateways", {}).get(gateway_name, {})
+            gw_perm = str(gw_cfg.get("permission_mode", "read_only"))
+            if gw_perm not in PERMISSION_MODES or (gateway_name != "cli" and gw_perm == "full_access"):
+                log_security_event(
+                    "gateway_permission_clamped",
+                    f"Clamped gateway '{gateway_name}' permission_mode '{gw_perm}' to 'read_only'",
+                    gateway=gateway_name,
+                    severity="warn",
+                )
+                gw_perm = "read_only"
+
+            sys_prompt = build_system_prompt(
+                base_prompt=str(ag.get("system_prompt", "")),
+                gateway=gateway_name,
+                provider_id=provider_id,
                 model=model,
-                messages=messages,
-                tools=TOOL_SCHEMAS,
+                permission_mode=gw_perm,
+                language=language,
             )
-            tool_calls = msg_obj.get("tool_calls") or []
-            if not tool_calls:
-                return str(msg_obj.get("content") or "")
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": str(msg_obj.get("content") or ""),
-                    "tool_calls": tool_calls,
-                }
-            )
-            for tc in tool_calls:
-                fn = tc.get("function") or {}
-                t_name = str(fn.get("name", ""))
-                t_args = fn.get("arguments", {})
-                t_res = execute_tool(t_name, t_args, permission_mode="read_only")
+            safe_user_msg = wrap_untrusted_content(f"gateway:{gateway_name}:{sender}", text)
+            messages: list[dict[str, Any]] = [
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": safe_user_msg},
+            ]
+
+            ctx_limit = int(estimate_context_window(model) * 0.9)
+            turn_deadline = time.monotonic() + MAX_GATEWAY_TURN_SECONDS
+            seen_calls: dict[tuple[str, str], int] = {}
+
+            for _iteration in range(MAX_GATEWAY_TOOL_ITERATIONS):
+                if time.monotonic() > turn_deadline:
+                    log_security_event("turn_timeout", "Gateway turn exceeded time limit", gateway=gateway_name, severity="warn")
+                    return "Error: request timed out before completion."
+                if estimate_tokens(messages) > ctx_limit:
+                    log_security_event("token_budget_exceeded", "Context token budget exceeded", gateway=gateway_name, severity="warn")
+                    return "Error: context token budget exceeded."
+
+                msg_obj = chat_completion_with_tools(
+                    provider_cfg=provider_cfg,
+                    model=model,
+                    messages=messages,
+                    tools=TOOL_SCHEMAS,
+                )
+                tool_calls = msg_obj.get("tool_calls") or []
+                if not tool_calls:
+                    return str(msg_obj.get("content") or "")
                 messages.append(
                     {
-                        "role": "tool",
-                        "tool_call_id": str(tc.get("id", t_name)),
-                        "content": t_res,
+                        "role": "assistant",
+                        "content": str(msg_obj.get("content") or ""),
+                        "tool_calls": tool_calls,
                     }
                 )
+                for tc in tool_calls:
+                    fn = tc.get("function") or {}
+                    t_name = str(fn.get("name", ""))
+                    t_args = fn.get("arguments", {})
+                    sig = (t_name, str(t_args))
+                    seen_calls[sig] = seen_calls.get(sig, 0) + 1
+                    if seen_calls[sig] >= 3:
+                        log_security_event(
+                            "tool_loop_detected",
+                            f"Repeated tool call '{t_name}' aborted",
+                            gateway=gateway_name,
+                            severity="warn",
+                        )
+                        return f"Error: aborted repeated tool loop on '{t_name}'."
+                    t_res = execute_tool(t_name, t_args, permission_mode=gw_perm)
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": str(tc.get("id", t_name)),
+                            "content": t_res,
+                        }
+                    )
+
+            log_security_event("max_tool_iterations", "Exceeded max tool iterations", gateway=gateway_name, severity="warn")
+            return "Error: exceeded maximum tool-call iterations."
+        finally:
+            self._concurrency_sem.release()
 
     def start(self, gateways: list[str] | None = None) -> list[GatewayStatus]:
         """Start enabled (or explicitly requested) gateways."""

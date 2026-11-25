@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import threading
@@ -13,6 +14,10 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
+
+from hirox.security import log_security_event
+
+MAX_WEBHOOK_BODY_BYTES = 1_048_576  # 1 MiB
 
 MessageHandler = Callable[[str, str, str], str]
 
@@ -53,7 +58,21 @@ class BaseGateway(ABC):
         env_name = str(self.config.get("token_env", "")).strip()
         return os.environ.get(env_name, "").strip() if env_name else ""
 
+    def is_sender_allowed(self, sender: str) -> bool:
+        allowed = self.config.get("allowed_senders") or []
+        if not allowed:
+            return True
+        return str(sender) in {str(s) for s in allowed}
+
     def dispatch_message(self, sender: str, text: str) -> str:
+        if not self.is_sender_allowed(sender):
+            log_security_event(
+                "gateway_sender_denied",
+                f"Sender '{sender}' not in allowed_senders",
+                gateway=self.name,
+                severity="warn",
+            )
+            return f"Permission denied: sender '{sender}' is not authorized for gateway '{self.name}'."
         if self.message_handler is None:
             return f"[{self.name}] received: {text}"
         return self.message_handler(self.name, sender, text)
@@ -146,8 +165,45 @@ class WebhookGateway(BaseGateway):
                     return
                 self._send_json(404, {"error": "not found"})
 
+            def _is_authorized(self) -> bool:
+                expected = gw.resolve_token()
+                if not expected:
+                    return True
+                auth_hdr = str(self.headers.get("Authorization", "")).strip()
+                x_tok = str(self.headers.get("X-Hirox-Token", "")).strip()
+                provided = ""
+                if auth_hdr.lower().startswith("bearer "):
+                    provided = auth_hdr[7:].strip()
+                elif x_tok:
+                    provided = x_tok
+                if provided and hmac.compare_digest(provided, expected):
+                    return True
+                log_security_event(
+                    "webhook_auth_failed",
+                    f"Unauthorized request to {self.path}",
+                    gateway=gw.name,
+                    severity="warn",
+                )
+                return False
+
             def do_POST(self) -> None:  # noqa: N802
-                length = int(self.headers.get("Content-Length", "0") or "0")
+                if not self._is_authorized():
+                    self._send_json(401, {"error": "unauthorized"})
+                    return
+                try:
+                    length = int(self.headers.get("Content-Length", "0") or "0")
+                except ValueError:
+                    self._send_json(400, {"error": "invalid content-length"})
+                    return
+                if length < 0 or length > MAX_WEBHOOK_BODY_BYTES:
+                    log_security_event(
+                        "webhook_payload_too_large",
+                        f"Rejected payload of {length} bytes",
+                        gateway=gw.name,
+                        severity="warn",
+                    )
+                    self._send_json(413, {"error": "payload too large"})
+                    return
                 raw = self.rfile.read(length).decode("utf-8", errors="replace") if length > 0 else "{}"
                 try:
                     data = json.loads(raw) if raw.strip() else {}

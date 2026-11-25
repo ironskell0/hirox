@@ -1142,7 +1142,8 @@ def run_chat_tui(gateway: str = "cli", console: Console | None = None) -> None:
         try:
             final_reply = ""
             was_cancelled = False
-            while True:
+            seen_tui_calls: dict[tuple[str, str], int] = {}
+            for _tui_iter in range(20):
                 def _call_llm() -> dict[str, Any]:
                     if chat_completion is not _ORIG_CHAT_COMPLETION:
                         return {
@@ -1204,23 +1205,35 @@ def run_chat_tui(gateway: str = "cli", console: Console | None = None) -> None:
                         fn = tc.get("function") or {}
                         t_name = str(fn.get("name", ""))
                         t_args = fn.get("arguments", {})
+                        sig = (t_name, str(t_args))
+                        seen_tui_calls[sig] = seen_tui_calls.get(sig, 0) + 1
+                        if seen_tui_calls[sig] >= 3:
+                            t_result = f"Error: aborted repeated tool loop on '{t_name}'."
+                            _render_tool_result(con, t_name, t_result)
+                            messages.append(
+                                {
+                                    "role": "tool",
+                                    "tool_call_id": str(tc.get("id", t_name)),
+                                    "content": t_result,
+                                }
+                            )
+                            continue
                         _render_tool_call(con, t_name, t_args)
 
                         # Handle ask-mode confirmation on main thread before cbreak watcher
-                        eff_perm = permission_mode
-                        if permission_mode == "ask" and t_name in ("write_file", "run_command"):
+                        eff_confirm = _confirm_tool
+                        if permission_mode == "ask" and t_name in ("write_file", "edit_file", "rollback_file", "run_command"):
                             parsed_args = (
                                 json.loads(t_args)
                                 if isinstance(t_args, str) and t_args.strip()
                                 else (dict(t_args) if isinstance(t_args, dict) else {})
                             )
-                            desc = (
-                                f"run_command: {parsed_args.get('command', '')}"
-                                if t_name == "run_command"
-                                else f"write_file: {parsed_args.get('path', '')}"
-                            )
+                            if t_name == "run_command":
+                                desc = f"run_command: {parsed_args.get('command', '')}"
+                            else:
+                                desc = f"{t_name}: {parsed_args.get('path', '')}"
                             if _confirm_tool(desc):
-                                eff_perm = "full_access"
+                                eff_confirm = lambda _d: True
                             else:
                                 t_result = f"Permission denied by user for {t_name}."
                                 messages.append(
@@ -1235,11 +1248,11 @@ def run_chat_tui(gateway: str = "cli", console: Console | None = None) -> None:
                         was_cancelled, t_result = _run_cancellable(
                             con,
                             f"Running {t_name}...",
-                            lambda n=t_name, a=t_args, p=eff_perm: execute_tool(
+                            lambda n=t_name, a=t_args, p=permission_mode, cf=eff_confirm: execute_tool(
                                 name=n,
                                 arguments=a,
                                 permission_mode=p,
-                                confirm_fn=_confirm_tool,
+                                confirm_fn=cf,
                                 cancel_event=cancel_event,
                             ),
                             cancel_event,
@@ -1262,6 +1275,8 @@ def run_chat_tui(gateway: str = "cli", console: Console | None = None) -> None:
 
                 final_reply = raw_content
                 break
+            else:
+                final_reply = "Stopped: exceeded maximum tool-call iterations (20)."
 
             if was_cancelled:
                 del messages[turn_start_len:]

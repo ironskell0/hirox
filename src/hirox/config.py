@@ -33,36 +33,50 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "enabled": False,
             "type": "webhook",
             "path": "/webhook",
+            "token_env": "HIROX_WEBHOOK_TOKEN",
+            "token": "",
+            "permission_mode": "read_only",
+            "allowed_senders": [],
         },
         "telegram": {
             "enabled": False,
             "type": "telegram",
             "token_env": "HIROX_TELEGRAM_TOKEN",
             "token": "",
+            "permission_mode": "read_only",
+            "allowed_senders": [],
         },
         "discord": {
             "enabled": False,
             "type": "discord",
             "token_env": "HIROX_DISCORD_TOKEN",
             "token": "",
+            "permission_mode": "read_only",
+            "allowed_senders": [],
         },
         "slack": {
             "enabled": False,
             "type": "slack",
             "token_env": "HIROX_SLACK_TOKEN",
             "token": "",
+            "permission_mode": "read_only",
+            "allowed_senders": [],
         },
         "whatsapp": {
             "enabled": False,
             "type": "whatsapp",
             "token_env": "HIROX_WHATSAPP_TOKEN",
             "token": "",
+            "permission_mode": "read_only",
+            "allowed_senders": [],
         },
         "matrix": {
             "enabled": False,
             "type": "matrix",
             "token_env": "HIROX_MATRIX_TOKEN",
             "token": "",
+            "permission_mode": "read_only",
+            "allowed_senders": [],
         },
     },
 }
@@ -107,12 +121,16 @@ def load_config(path: Path | None = None) -> dict[str, Any]:
 
 
 def save_config(config: dict[str, Any], path: Path | None = None) -> Path:
-    """Persist configuration to disk."""
+    """Persist configuration to disk with restricted 0600 permissions."""
     cfg_path = path or get_config_path()
     cfg_path.parent.mkdir(parents=True, exist_ok=True)
     with cfg_path.open("w", encoding="utf-8") as f:
         json.dump(config, f, indent=2, ensure_ascii=False)
         f.write("\n")
+    try:
+        os.chmod(cfg_path, 0o600)
+    except OSError:
+        pass
     return cfg_path
 
 

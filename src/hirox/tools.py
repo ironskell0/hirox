@@ -16,6 +16,15 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable
 
+from hirox.security import (
+    backup_file,
+    check_command_safety,
+    latest_backup_for,
+    log_security_event,
+    validate_path,
+    wrap_untrusted_content,
+)
+
 PERMISSION_MODES: dict[str, tuple[str, str]] = {
     "read_only": ("Only Read", "Browse directories and read files only"),
     "ask": ("Ask Permission", "Read freely; ask before running commands or writing"),
@@ -56,7 +65,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "write_file",
-            "description": "Write or overwrite a file with text content.",
+            "description": "Write or overwrite a file with text content (creates automatic backup).",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -64,6 +73,36 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "content": {"type": "string", "description": "Text content to write"},
                 },
                 "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_file",
+            "description": "Safely patch an existing file by replacing an exact text snippet (creates automatic backup).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path to edit"},
+                    "old_text": {"type": "string", "description": "Exact text to replace"},
+                    "new_text": {"type": "string", "description": "Replacement text"},
+                },
+                "required": ["path", "old_text", "new_text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "rollback_file",
+            "description": "Restore a file from its most recent automatic backup.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path to restore"},
+                },
+                "required": ["path"],
             },
         },
     },
@@ -148,7 +187,10 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
 
 
 def _tool_list_dir(path: str = ".") -> str:
-    target = Path(path).expanduser()
+    ok, target, err = validate_path(path)
+    if not ok or target is None:
+        log_security_event("path_blocked", err, severity="warn")
+        return err
     if not target.exists():
         return f"Error: path does not exist: {target}"
     if not target.is_dir():
@@ -159,7 +201,10 @@ def _tool_list_dir(path: str = ".") -> str:
 
 
 def _tool_read_file(path: str, start_line: int = 1, limit: int = 200) -> str:
-    target = Path(path).expanduser()
+    ok, target, err = validate_path(path)
+    if not ok or target is None:
+        log_security_event("path_blocked", err, severity="warn")
+        return err
     if not target.exists():
         return f"Error: file does not exist: {target}"
     if not target.is_file():
@@ -173,10 +218,48 @@ def _tool_read_file(path: str, start_line: int = 1, limit: int = 200) -> str:
 
 
 def _tool_write_file(path: str, content: str) -> str:
-    target = Path(path).expanduser()
+    ok, target, err = validate_path(path)
+    if not ok or target is None:
+        log_security_event("path_blocked", err, severity="warn")
+        return err
     target.parent.mkdir(parents=True, exist_ok=True)
+    bak = backup_file(target)
     target.write_text(content, encoding="utf-8")
-    return f"Wrote {len(content)} chars to {target}"
+    bak_note = f" (backup: {bak.name})" if bak else ""
+    return f"Wrote {len(content)} chars to {target}{bak_note}"
+
+
+def _tool_edit_file(path: str, old_text: str, new_text: str) -> str:
+    ok, target, err = validate_path(path)
+    if not ok or target is None:
+        log_security_event("path_blocked", err, severity="warn")
+        return err
+    if not target.exists() or not target.is_file():
+        return f"Error: file does not exist: {target}"
+    raw = target.read_text(encoding="utf-8", errors="replace")
+    count = raw.count(old_text)
+    if count == 0:
+        return "Error: old_text not found in file."
+    if count > 1:
+        return f"Error: old_text matched {count} times; provide a more specific snippet."
+    bak = backup_file(target)
+    updated = raw.replace(old_text, new_text, 1)
+    target.write_text(updated, encoding="utf-8")
+    bak_note = f" (backup: {bak.name})" if bak else ""
+    return f"Patched {target}{bak_note}"
+
+
+def _tool_rollback_file(path: str) -> str:
+    ok, target, err = validate_path(path)
+    if not ok or target is None:
+        log_security_event("path_blocked", err, severity="warn")
+        return err
+    bak = latest_backup_for(target)
+    if bak is None or not bak.exists():
+        return f"Error: no backup found for {target}"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(bak.read_bytes())
+    return f"Restored {target} from backup {bak.name}"
 
 
 def _run_command_once(
@@ -321,7 +404,7 @@ def _tool_web_search(query: str, max_results: int = 5) -> str:
         if snip:
             entry += f"\n   {snip}"
         results.append(entry)
-    return "\n\n".join(results)
+    return wrap_untrusted_content("web_search:duckduckgo", "\n\n".join(results))
 
 
 def _tool_web_fetch(url: str, max_chars: int = 4000) -> str:
@@ -355,7 +438,7 @@ def _tool_web_fetch(url: str, max_chars: int = 4000) -> str:
     cap = max(200, min(12000, int(max_chars)))
     if len(cleaned) > cap:
         cleaned = cleaned[:cap] + "\n...(truncated)"
-    return cleaned or "(empty page)"
+    return wrap_untrusted_content(f"web_fetch:{target}", cleaned or "(empty page)")
 
 
 _WORKFLOW_STATE: dict[str, Any] = {"goal": "", "steps": []}
@@ -414,6 +497,14 @@ def execute_tool(
     cancel_event: threading.Event | None = None,
 ) -> str:
     """Execute a Hirox tool while enforcing permission_mode."""
+    if permission_mode not in PERMISSION_MODES:
+        log_security_event(
+            "invalid_permission_mode",
+            f"Unknown permission_mode '{permission_mode}', falling back to read_only",
+            severity="warn",
+        )
+        permission_mode = "read_only"
+
     if isinstance(arguments, str):
         try:
             args = json.loads(arguments) if arguments.strip() else {}
@@ -444,16 +535,33 @@ def execute_tool(
         if name == "workflow_plan":
             return _tool_workflow_plan(args)
 
-        if name in ("write_file", "run_command"):
+        if name in ("write_file", "edit_file", "rollback_file", "run_command"):
             if permission_mode == "read_only":
+                log_security_event("permission_denied", f"{name} blocked in read_only mode", severity="info")
                 return f"Permission denied: '{name}' is blocked in read_only mode."
+
+            if name == "run_command":
+                cmd_str = str(args.get("command", ""))
+                safety, reason = check_command_safety(cmd_str)
+                if safety == "block":
+                    log_security_event("catastrophic_command_blocked", f"{reason}: {cmd_str}", severity="critical")
+                    return f"Security blocked: {reason} is not permitted."
+                if safety == "confirm":
+                    log_security_event("destructive_command_prompt", f"{reason}: {cmd_str}", severity="warn")
+                    if confirm_fn is None or not confirm_fn(f"DESTRUCTIVE ({reason}): {cmd_str}"):
+                        return f"Security blocked: destructive command ({reason}) requires explicit confirmation."
+
             if permission_mode == "ask":
-                desc = (
-                    f"run_command: {args.get('command', '')}"
-                    if name == "run_command"
-                    else f"write_file: {args.get('path', '')}"
-                )
+                if name == "run_command":
+                    desc = f"run_command: {args.get('command', '')}"
+                elif name == "edit_file":
+                    desc = f"edit_file: {args.get('path', '')}"
+                elif name == "rollback_file":
+                    desc = f"rollback_file: {args.get('path', '')}"
+                else:
+                    desc = f"write_file: {args.get('path', '')}"
                 if confirm_fn is None or not confirm_fn(desc):
+                    log_security_event("permission_denied", f"User denied {name}", severity="info")
                     return f"Permission denied by user for {name}."
 
             if name == "write_file":
@@ -461,6 +569,14 @@ def execute_tool(
                     path=str(args.get("path", "")),
                     content=str(args.get("content", "")),
                 )
+            if name == "edit_file":
+                return _tool_edit_file(
+                    path=str(args.get("path", "")),
+                    old_text=str(args.get("old_text", "")),
+                    new_text=str(args.get("new_text", "")),
+                )
+            if name == "rollback_file":
+                return _tool_rollback_file(path=str(args.get("path", "")))
             return _tool_run_command(
                 str(args.get("command", "")),
                 timeout=int(args.get("timeout", 60)),
