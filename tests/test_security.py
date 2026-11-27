@@ -230,3 +230,41 @@ def test_runtime_loop_detection_and_security_logging(tmp_path: Path, monkeypatch
     assert "mysecrettoken123456" not in log_text
     assert "[REDACTED_TOKEN]" in log_text
     assert redact_secrets("AKIAIOSFODNN7EXAMPLE") == "[REDACTED_TOKEN]"
+
+
+def test_gateway_challenge_response_pairing(tmp_path, monkeypatch):
+    monkeypatch.setenv("HIROX_HOME", str(tmp_path))
+    from click.testing import CliRunner
+    from hirox.cli import main
+    from hirox.gateway import DiscordGateway
+
+    called = []
+    gw = DiscordGateway(
+        "discord",
+        {"enabled": True, "type": "discord"},
+        message_handler=lambda g, s, t: (called.append((g, s, t)), f"echo:{t}")[1],
+    )
+    # First message triggers challenge
+    r1 = gw.dispatch_message("user42", "hello")
+    assert "hirox pair " in r1
+    assert not called
+    challenge = r1.split("hirox pair ")[1].splitlines()[0].strip()
+
+    # Wrong code is rejected
+    r_bad = gw.dispatch_message("user42", "0000-0000")
+    assert "Invalid verification code" in r_bad
+    assert not called
+
+    # Run `hirox pair <challenge>` CLI to get real HMAC code
+    res = CliRunner().invoke(main, ["pair", challenge])
+    assert res.exit_code == 0
+    code = res.output.strip()
+
+    # Reply with valid code pairs the sender
+    r_ok = gw.dispatch_message("user42", code)
+    assert "Verified!" in r_ok
+
+    # Subsequent messages go straight to handler
+    r2 = gw.dispatch_message("user42", "hi again")
+    assert r2 == "echo:hi again"
+    assert called == [("discord", "user42", "hi again")]

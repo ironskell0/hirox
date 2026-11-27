@@ -183,6 +183,22 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "discord_send",
+            "description": "Proactively send a Discord DM or channel message to the user without waiting for them to message first.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message": {"type": "string", "description": "Message text to send on Discord"},
+                    "user_id": {"type": "string", "description": "Optional Discord user ID for DM (defaults to paired user)"},
+                    "channel_id": {"type": "string", "description": "Optional Discord channel ID instead of DM"},
+                },
+                "required": ["message"],
+            },
+        },
+    },
 ]
 
 
@@ -534,6 +550,32 @@ def execute_tool(
             )
         if name == "workflow_plan":
             return _tool_workflow_plan(args)
+        if name == "discord_send":
+            from hirox.config import load_config
+            from hirox.gateway import DiscordGateway
+            from hirox.security import _load_paired_senders
+
+            msg_text = str(args.get("message", "")).strip()
+            if not msg_text:
+                return "Error: message is required."
+            cfg = load_config()
+            dc_cfg = (cfg.get("gateways") or {}).get("discord") or {}
+            gw = DiscordGateway("discord", dc_cfg)
+            ch_id = str(args.get("channel_id", "")).strip()
+            uid = str(args.get("user_id", "")).strip()
+            if ch_id:
+                gw.send_message(ch_id, msg_text)
+                return f"Sent Discord message to channel {ch_id}."
+            if not uid:
+                paired = _load_paired_senders()
+                for k in paired:
+                    if k.startswith("discord:"):
+                        uid = k.split(":", 1)[1]
+                        break
+            if not uid:
+                return "Error: no user_id/channel_id provided and no paired Discord user found."
+            gw.send_dm(uid, msg_text)
+            return f"Sent Discord DM to user {uid}."
 
         if name in ("write_file", "edit_file", "rollback_file", "run_command"):
             if permission_mode == "read_only":

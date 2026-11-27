@@ -20,6 +20,7 @@ from hirox.config import (
 from hirox.config_tui import run_config_tui
 from hirox.doctor import run_diagnostics
 from hirox.runtime import HiroxRuntime
+from hirox.security import compute_pairing_code
 from hirox.tui import run_chat_tui
 
 console = Console()
@@ -117,6 +118,14 @@ def doctor(as_json: bool) -> None:
     console.print(table)
     if has_fail:
         sys.exit(1)
+
+
+@main.command()
+@click.argument("challenge")
+def pair(challenge: str) -> None:
+    """Compute the 8-character verification code for a gateway pairing challenge."""
+    code = compute_pairing_code(challenge)
+    click.echo(code)
 
 
 @main.group(invoke_without_command=True)

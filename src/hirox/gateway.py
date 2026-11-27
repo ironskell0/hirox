@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import hmac
 import json
 import os
+import socket
+import ssl
+import struct
 import threading
 import time
 import urllib.error
@@ -15,7 +20,13 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
 
-from hirox.security import log_security_event
+from hirox.security import (
+    create_pairing_challenge,
+    has_pending_challenge,
+    is_sender_paired,
+    log_security_event,
+    verify_pairing_response,
+)
 
 MAX_WEBHOOK_BODY_BYTES = 1_048_576  # 1 MiB
 
@@ -73,6 +84,23 @@ class BaseGateway(ABC):
                 severity="warn",
             )
             return f"Permission denied: sender '{sender}' is not authorized for gateway '{self.name}'."
+        requires_pairing = bool(
+            self.config.get(
+                "require_pairing",
+                self.gateway_type in ("telegram", "discord", "slack", "whatsapp", "matrix"),
+            )
+        )
+        if requires_pairing and not is_sender_paired(self.name, sender):
+            if has_pending_challenge(self.name, sender):
+                _ok, msg = verify_pairing_response(self.name, sender, text)
+                return msg
+            challenge = create_pairing_challenge(self.name, sender)
+            return (
+                "Hirox Gateway Verification Required\n"
+                "Run this command in your Hirox terminal:\n"
+                f"  hirox pair {challenge}\n"
+                "Then reply here with the 8-character code it outputs."
+            )
         if self.message_handler is None:
             return f"[{self.name}] received: {text}"
         return self.message_handler(self.name, sender, text)
@@ -279,6 +307,7 @@ class TelegramGateway(BaseGateway):
         super().__init__(name=name, config=config, message_handler=message_handler)
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
+        self._bot_username = ""
 
     def _api_call(self, token: str, method: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         url = f"https://api.telegram.org/bot{token}/{method}"
@@ -292,6 +321,11 @@ class TelegramGateway(BaseGateway):
         with urllib.request.urlopen(req, timeout=25) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
+    def _send_chunked(self, token: str, chat_id: Any, text: str) -> None:
+        msg = text or "(empty response)"
+        for i in range(0, len(msg), 4000):
+            self._api_call(token, "sendMessage", {"chat_id": chat_id, "text": msg[i : i + 4000]})
+
     def _poll_loop(self, token: str) -> None:
         offset = 0
         while not self._stop_event.is_set():
@@ -301,11 +335,26 @@ class TelegramGateway(BaseGateway):
                     offset = max(offset, int(upd.get("update_id", 0)) + 1)
                     msg = upd.get("message") or {}
                     text = str(msg.get("text") or "").strip()
-                    chat_id = (msg.get("chat") or {}).get("id")
-                    if text and chat_id is not None:
-                        reply = self.dispatch_message(str(chat_id), text)
-                        self._api_call(token, "sendMessage", {"chat_id": chat_id, "text": reply[:4000]})
-            except Exception:
+                    chat = msg.get("chat") or {}
+                    chat_id = chat.get("id")
+                    sender_user = str((msg.get("from") or {}).get("username") or "")
+                    if not text or chat_id is None:
+                        continue
+                    if text == "/start":
+                        self._send_chunked(token, chat_id, "Hirox Telegram gateway connected. Send any message to chat.")
+                        continue
+                    sender_id = str(chat_id)
+                    if not (self.is_sender_allowed(sender_id) or (sender_user and self.is_sender_allowed(sender_user))):
+                        self._send_chunked(token, chat_id, f"Permission denied for sender '{sender_id}'.")
+                        continue
+                    try:
+                        self._api_call(token, "sendChatAction", {"chat_id": chat_id, "action": "typing"})
+                    except Exception:
+                        pass
+                    reply = self.dispatch_message(sender_id, text)
+                    self._send_chunked(token, chat_id, reply)
+            except Exception as exc:
+                self._detail = f"polling error: {str(exc)[:60]}"
                 time.sleep(2.0)
 
     def start(self) -> None:
@@ -316,11 +365,18 @@ class TelegramGateway(BaseGateway):
             self.running = False
             self._detail = f"missing token ({self.config.get('token_env', 'TELEGRAM_BOT_TOKEN')})"
             return
+        try:
+            me = self._api_call(token, "getMe")
+            self._bot_username = str((me.get("result") or {}).get("username") or "")
+        except Exception as exc:
+            self.running = False
+            self._detail = f"auth failed: {str(exc)[:60]}"
+            return
         self._stop_event.clear()
         self._thread = threading.Thread(target=self._poll_loop, args=(token,), daemon=True)
         self._thread.start()
         self.running = True
-        self._detail = "polling Telegram Bot API"
+        self._detail = f"polling @{self._bot_username}" if self._bot_username else "polling Telegram Bot API"
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -328,37 +384,301 @@ class TelegramGateway(BaseGateway):
         self._detail = "stopped"
 
 
+class _SimpleTLSWebSocket:
+    """Minimal stdlib RFC 6455 TLS WebSocket client for Discord Gateway."""
+
+    def __init__(self, url: str, timeout: float = 30.0) -> None:
+        parsed = urllib.parse.urlparse(url)
+        host = parsed.hostname or ""
+        port = parsed.port or 443
+        path = parsed.path or "/"
+        if parsed.query:
+            path = f"{path}?{parsed.query}"
+        raw_sock = socket.create_connection((host, port), timeout=timeout)
+        ctx = ssl.create_default_context()
+        self.sock = ctx.wrap_socket(raw_sock, server_hostname=host)
+        self.sock.settimeout(timeout)
+        key = base64.b64encode(os.urandom(16)).decode("ascii")
+        req = (
+            f"GET {path} HTTP/1.1\r\n"
+            f"Host: {host}\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\n"
+            "Sec-WebSocket-Version: 13\r\n\r\n"
+        )
+        self.sock.sendall(req.encode("ascii"))
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise ConnectionError("WebSocket handshake failed")
+            buf += chunk
+        status_line = buf.split(b"\r\n", 1)[0]
+        if b"101" not in status_line:
+            raise ConnectionError(f"WebSocket upgrade rejected: {status_line.decode('ascii', errors='replace')}")
+        self._extra = buf.split(b"\r\n\r\n", 1)[1]
+        self._send_lock = threading.Lock()
+
+    def _recv_exact(self, n: int) -> bytes:
+        out = bytearray()
+        if self._extra:
+            take = min(n, len(self._extra))
+            out.extend(self._extra[:take])
+            self._extra = self._extra[take:]
+        while len(out) < n:
+            chunk = self.sock.recv(n - len(out))
+            if not chunk:
+                raise ConnectionError("WebSocket closed")
+            out.extend(chunk)
+        return bytes(out)
+
+    def recv_json(self) -> dict[str, Any] | None:
+        while True:
+            hdr = self._recv_exact(2)
+            opcode = hdr[0] & 0x0F
+            masked = bool(hdr[1] & 0x80)
+            length = hdr[1] & 0x7F
+            if length == 126:
+                length = struct.unpack("!H", self._recv_exact(2))[0]
+            elif length == 127:
+                length = struct.unpack("!Q", self._recv_exact(8))[0]
+            mask_key = self._recv_exact(4) if masked else b""
+            payload = self._recv_exact(length)
+            if masked:
+                payload = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
+            if opcode == 0x8:  # close
+                return None
+            if opcode == 0x9:  # ping -> pong
+                self._send_frame(0xA, payload)
+                continue
+            if opcode in (0x1, 0x2):
+                return json.loads(payload.decode("utf-8"))
+
+    def _send_frame(self, opcode: int, data: bytes) -> None:
+        mask = os.urandom(4)
+        n = len(data)
+        header = bytearray([0x80 | opcode])
+        if n < 126:
+            header.append(0x80 | n)
+        elif n < 65536:
+            header.append(0x80 | 126)
+            header.extend(struct.pack("!H", n))
+        else:
+            header.append(0x80 | 127)
+            header.extend(struct.pack("!Q", n))
+        header.extend(mask)
+        masked_data = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+        with self._send_lock:
+            self.sock.sendall(bytes(header) + masked_data)
+
+    def send_json(self, obj: dict[str, Any]) -> None:
+        self._send_frame(0x1, json.dumps(obj).encode("utf-8"))
+
+    def close(self) -> None:
+        try:
+            self._send_frame(0x8, b"")
+        except Exception:
+            pass
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+
+
 class DiscordGateway(BaseGateway):
-    """Discord REST Bot gateway."""
+    """Discord Gateway WebSocket + REST Bot gateway."""
+
+    def __init__(
+        self,
+        name: str,
+        config: dict[str, Any] | None = None,
+        message_handler: MessageHandler | None = None,
+    ) -> None:
+        super().__init__(name=name, config=config, message_handler=message_handler)
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._bot_id = ""
+        self._bot_tag = ""
+
+    def _rest_call(self, token: str, method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        url = f"https://discord.com/api/v10{path}"
+        data = json.dumps(payload).encode("utf-8") if payload is not None else None
+        headers = {
+            "Authorization": f"Bot {token}",
+            "User-Agent": "HiroxBot (https://github.com/hirox, 1.0)",
+        }
+        if data is not None:
+            headers["Content-Type"] = "application/json"
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            raw = resp.read().decode("utf-8")
+            return json.loads(raw) if raw.strip() else {}
 
     def send_message(self, channel_id: str, content: str) -> dict[str, Any]:
         token = self.resolve_token()
         if not token:
             raise RuntimeError("Discord bot token missing.")
-        url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
-        req = urllib.request.Request(
-            url,
-            data=json.dumps({"content": content[:2000]}).encode("utf-8"),
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bot {token}",
-            },
-            method="POST",
+        msg = content or "(empty response)"
+        last: dict[str, Any] = {}
+        for i in range(0, len(msg), 2000):
+            last = self._rest_call(token, "POST", f"/channels/{channel_id}/messages", {"content": msg[i : i + 2000]})
+        return last
+
+    def edit_message(self, channel_id: str, message_id: str, content: str) -> dict[str, Any]:
+        token = self.resolve_token()
+        if not token:
+            raise RuntimeError("Discord bot token missing.")
+        return self._rest_call(
+            token,
+            "PATCH",
+            f"/channels/{channel_id}/messages/{message_id}",
+            {"content": (content or "(empty response)")[:2000]},
         )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+
+    def send_dm(self, user_id: str, content: str) -> dict[str, Any]:
+        token = self.resolve_token()
+        if not token:
+            raise RuntimeError("Discord bot token missing.")
+        dm = self._rest_call(token, "POST", "/users/@me/channels", {"recipient_id": str(user_id)})
+        ch_id = str(dm.get("id") or "")
+        if not ch_id:
+            raise RuntimeError("Could not open Discord DM channel.")
+        return self.send_message(ch_id, content)
+
+    def send_streaming_reply(self, channel_id: str, reply: str) -> None:
+        """Send an initial message and progressively edit it to stream the reply."""
+        msg = reply or "(empty response)"
+        first_part = msg[:2000]
+        if len(first_part) <= 180:
+            self.send_message(channel_id, msg)
+            return
+        step = max(120, len(first_part) // 4)
+        sent = self.send_message(channel_id, first_part[:step] + " ▌")
+        msg_id = str(sent.get("id") or "")
+        if not msg_id:
+            if len(msg) > 2000:
+                self.send_message(channel_id, msg[2000:])
+            return
+        pos = step
+        while pos < len(first_part):
+            time.sleep(0.75)
+            pos = min(len(first_part), pos + step)
+            suffix = " ▌" if pos < len(first_part) else ""
+            self.edit_message(channel_id, msg_id, first_part[:pos] + suffix)
+        if len(msg) > 2000:
+            self.send_message(channel_id, msg[2000:])
+
+    def _gateway_loop(self, token: str) -> None:
+        seq: list[int | None] = [None]
+        while not self._stop_event.is_set():
+            ws: _SimpleTLSWebSocket | None = None
+            hb_stop = threading.Event()
+            try:
+                ws = _SimpleTLSWebSocket("wss://gateway.discord.gg/?v=10&encoding=json", timeout=60.0)
+                hello = ws.recv_json()
+                if not hello or hello.get("op") != 10:
+                    raise RuntimeError("Expected Discord Hello (op 10)")
+                hb_interval = max(5.0, float((hello.get("d") or {}).get("heartbeat_interval", 41250)) / 1000.0)
+
+                def _hb() -> None:
+                    while not hb_stop.wait(hb_interval) and not self._stop_event.is_set():
+                        try:
+                            ws.send_json({"op": 1, "d": seq[0]})
+                        except Exception:
+                            break
+
+                threading.Thread(target=_hb, daemon=True).start()
+                ws.send_json(
+                    {
+                        "op": 2,
+                        "d": {
+                            "token": token,
+                            "intents": 37377,  # GUILDS | GUILD_MESSAGES | DIRECT_MESSAGES | MESSAGE_CONTENT
+                            "properties": {"os": "linux", "browser": "hirox", "device": "hirox"},
+                        },
+                    }
+                )
+                while not self._stop_event.is_set():
+                    ev = ws.recv_json()
+                    if ev is None:
+                        break
+                    if ev.get("s") is not None:
+                        seq[0] = int(ev["s"])
+                    op = ev.get("op")
+                    if op == 1:
+                        ws.send_json({"op": 1, "d": seq[0]})
+                        continue
+                    if op in (7, 9):
+                        break
+                    if op == 0 and ev.get("t") == "READY":
+                        user = (ev.get("d") or {}).get("user") or {}
+                        self._bot_id = str(user.get("id") or "")
+                        self._bot_tag = str(user.get("username") or "")
+                        self._detail = f"connected @{self._bot_tag}" if self._bot_tag else "connected (Discord WS)"
+                    elif op == 0 and ev.get("t") == "MESSAGE_CREATE":
+                        d = ev.get("d") or {}
+                        author = d.get("author") or {}
+                        if author.get("bot"):
+                            continue
+                        content = str(d.get("content") or "").strip()
+                        channel_id = str(d.get("channel_id") or "")
+                        sender_id = str(author.get("id") or "")
+                        if not content or not channel_id:
+                            continue
+                        if self._bot_id:
+                            content = content.replace(f"<@{self._bot_id}>", "").replace(f"<@!{self._bot_id}>", "").strip()
+                        if not content:
+                            continue
+                        typing_stop = threading.Event()
+
+                        def _typing_loop(ch: str = channel_id, stop_ev: threading.Event = typing_stop) -> None:
+                            while not stop_ev.is_set():
+                                try:
+                                    self._rest_call(token, "POST", f"/channels/{ch}/typing")
+                                except Exception:
+                                    pass
+                                stop_ev.wait(7.0)
+
+                        threading.Thread(target=_typing_loop, daemon=True).start()
+                        try:
+                            reply = self.dispatch_message(sender_id or channel_id, content)
+                        finally:
+                            typing_stop.set()
+                        self.send_streaming_reply(channel_id, reply)
+            except Exception as exc:
+                self._detail = f"reconnecting ({str(exc)[:45]})"
+            finally:
+                hb_stop.set()
+                if ws is not None:
+                    ws.close()
+            if not self._stop_event.is_set():
+                self._stop_event.wait(3.0)
 
     def start(self) -> None:
         if not self.enabled:
             return
-        if not self.resolve_token():
+        token = self.resolve_token()
+        if not token:
             self.running = False
             self._detail = f"missing token ({self.config.get('token_env', 'DISCORD_BOT_TOKEN')})"
             return
+        try:
+            me = self._rest_call(token, "GET", "/users/@me")
+            self._bot_id = str(me.get("id") or "")
+            self._bot_tag = str(me.get("username") or "")
+        except Exception as exc:
+            self.running = False
+            self._detail = f"auth failed: {str(exc)[:60]}"
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._gateway_loop, args=(token,), daemon=True)
+        self._thread.start()
         self.running = True
-        self._detail = "active (Discord REST ready)"
+        self._detail = f"connecting @{self._bot_tag}" if self._bot_tag else "connecting Discord WS"
 
     def stop(self) -> None:
+        self._stop_event.set()
         self.running = False
         self._detail = "stopped"
 

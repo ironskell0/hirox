@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
 import re
+import secrets
+import time
 import shutil
 import time
 from datetime import datetime, timezone
@@ -177,3 +181,133 @@ def log_security_event(
             pass
     except Exception:
         pass
+
+
+_PENDING_CHALLENGES: dict[str, dict[str, Any]] = {}
+
+
+def get_pairing_secret() -> bytes:
+    """Return (or create) the local 32-byte HMAC secret for gateway pairing."""
+    key_path = get_home_dir() / "pairing_secret.key"
+    key_path.parent.mkdir(parents=True, exist_ok=True)
+    if key_path.exists():
+        raw = key_path.read_text(encoding="utf-8").strip()
+        if raw:
+            return raw.encode("utf-8")
+    secret_hex = secrets.token_hex(32)
+    key_path.write_text(secret_hex + "\n", encoding="utf-8")
+    try:
+        os.chmod(key_path, 0o600)
+    except OSError:
+        pass
+    return secret_hex.encode("utf-8")
+
+
+def compute_pairing_code(challenge: str) -> str:
+    """Compute the 8-char XXXX-XXXX HMAC-SHA256 verification code for a challenge."""
+    digest = hmac.new(get_pairing_secret(), challenge.strip().encode("utf-8"), hashlib.sha256).hexdigest().upper()
+    return f"{digest[:4]}-{digest[4:8]}"
+
+
+def _paired_senders_path() -> Path:
+    return get_home_dir() / "paired_senders.json"
+
+
+def _load_paired_senders() -> dict[str, Any]:
+    p = _paired_senders_path()
+    if not p.exists():
+        return {}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def is_sender_paired(gateway: str, sender: str) -> bool:
+    data = _load_paired_senders()
+    return f"{gateway}:{sender}" in data
+
+
+def mark_sender_paired(gateway: str, sender: str) -> None:
+    p = _paired_senders_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    data = _load_paired_senders()
+    data[f"{gateway}:{sender}"] = {"paired_at": datetime.now(timezone.utc).isoformat()}
+    p.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    try:
+        os.chmod(p, 0o600)
+    except OSError:
+        pass
+
+
+def has_pending_challenge(gateway: str, sender: str) -> bool:
+    key = f"{gateway}:{sender}"
+    entry = _PENDING_CHALLENGES.get(key)
+    if not entry:
+        return False
+    if time.time() > float(entry.get("expires_at", 0)):
+        _PENDING_CHALLENGES.pop(key, None)
+        return False
+    return True
+
+
+def create_pairing_challenge(gateway: str, sender: str) -> str:
+    """Create a 5-minute one-time challenge token for an unpaired gateway sender."""
+    challenge = secrets.token_hex(6).upper()
+    _PENDING_CHALLENGES[f"{gateway}:{sender}"] = {
+        "challenge": challenge,
+        "expected": compute_pairing_code(challenge),
+        "expires_at": time.time() + 300.0,
+        "attempts": 0,
+    }
+    log_security_event(
+        "gateway_pairing_challenge",
+        f"Issued pairing challenge for sender '{sender}'",
+        gateway=gateway,
+    )
+    return challenge
+
+
+def verify_pairing_response(gateway: str, sender: str, response_text: str) -> tuple[bool, str]:
+    """Verify a sender's pairing code response."""
+    key = f"{gateway}:{sender}"
+    entry = _PENDING_CHALLENGES.get(key)
+    if not entry or time.time() > float(entry.get("expires_at", 0)):
+        _PENDING_CHALLENGES.pop(key, None)
+        new_ch = create_pairing_challenge(gateway, sender)
+        return False, (
+            "Challenge expired. Run this command in your Hirox terminal:\n"
+            f"  hirox pair {new_ch}\n"
+            "Then reply here with the 8-character code."
+        )
+    cleaned = re.sub(r"[^A-Za-z0-9]", "", response_text.strip().upper())
+    expected_clean = re.sub(r"[^A-Za-z0-9]", "", str(entry["expected"]))
+    if cleaned and hmac.compare_digest(cleaned, expected_clean):
+        _PENDING_CHALLENGES.pop(key, None)
+        mark_sender_paired(gateway, sender)
+        log_security_event(
+            "gateway_sender_paired",
+            f"Sender '{sender}' verified and paired",
+            gateway=gateway,
+        )
+        return True, "Verified! Gateway paired. You can now chat with Hirox."
+    entry["attempts"] = int(entry.get("attempts", 0)) + 1
+    log_security_event(
+        "gateway_pairing_failed",
+        f"Invalid pairing code from sender '{sender}' (attempt {entry['attempts']})",
+        gateway=gateway,
+        severity="warn",
+    )
+    if entry["attempts"] >= 5:
+        _PENDING_CHALLENGES.pop(key, None)
+        new_ch = create_pairing_challenge(gateway, sender)
+        return False, (
+            "Too many invalid attempts. New challenge issued.\n"
+            f"Run in your Hirox terminal:\n  hirox pair {new_ch}\n"
+            "Then reply here with the 8-character code."
+        )
+    return False, (
+        f"Invalid verification code ({entry['attempts']}/5). "
+        f"Run `hirox pair {entry['challenge']}` in your Hirox terminal and reply with the code."
+    )
