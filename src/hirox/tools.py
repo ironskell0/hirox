@@ -199,6 +199,26 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "gateway_send",
+            "description": "Proactively send a message to the user on any configured gateway (telegram, discord, slack, whatsapp, matrix).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "gateway": {
+                        "type": "string",
+                        "enum": ["telegram", "discord", "slack", "whatsapp", "matrix"],
+                        "description": "Target gateway name",
+                    },
+                    "message": {"type": "string", "description": "Message text to send"},
+                    "target": {"type": "string", "description": "Optional chat_id/user_id/channel/phone/room_id (defaults to paired user)"},
+                },
+                "required": ["gateway", "message"],
+            },
+        },
+    },
 ]
 
 
@@ -576,6 +596,45 @@ def execute_tool(
                 return "Error: no user_id/channel_id provided and no paired Discord user found."
             gw.send_dm(uid, msg_text)
             return f"Sent Discord DM to user {uid}."
+        if name == "gateway_send":
+            from hirox.config import load_config
+            from hirox.gateway import (
+                DiscordGateway,
+                MatrixGateway,
+                SlackGateway,
+                TelegramGateway,
+                WhatsAppGateway,
+            )
+            from hirox.security import _load_paired_senders
+
+            gw_name = str(args.get("gateway", "")).strip().lower()
+            msg_text = str(args.get("message", "")).strip()
+            target = str(args.get("target", "")).strip()
+            if not gw_name or not msg_text:
+                return "Error: gateway and message are required."
+            cfg = load_config()
+            gw_cfg = (cfg.get("gateways") or {}).get(gw_name) or {}
+            if not target:
+                paired = _load_paired_senders()
+                for k in paired:
+                    if k.startswith(f"{gw_name}:"):
+                        target = k.split(":", 1)[1]
+                        break
+            if not target:
+                return f"Error: no target provided and no paired sender found for '{gw_name}'."
+            if gw_name == "telegram":
+                TelegramGateway("telegram", gw_cfg).send_message(target, msg_text)
+            elif gw_name == "discord":
+                DiscordGateway("discord", gw_cfg).send_dm(target, msg_text)
+            elif gw_name == "slack":
+                SlackGateway("slack", gw_cfg).send_message(target, msg_text)
+            elif gw_name == "whatsapp":
+                WhatsAppGateway("whatsapp", gw_cfg).send_message(target, msg_text)
+            elif gw_name == "matrix":
+                MatrixGateway("matrix", gw_cfg).send_message(target, msg_text)
+            else:
+                return f"Error: unsupported gateway '{gw_name}'."
+            return f"Sent message via {gw_name} to {target}."
 
         if name in ("write_file", "edit_file", "rollback_file", "run_command"):
             if permission_mode == "read_only":

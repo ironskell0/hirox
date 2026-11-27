@@ -326,6 +326,46 @@ class TelegramGateway(BaseGateway):
         for i in range(0, len(msg), 4000):
             self._api_call(token, "sendMessage", {"chat_id": chat_id, "text": msg[i : i + 4000]})
 
+    def send_message(self, chat_id: str | int, text: str) -> dict[str, Any]:
+        token = self.resolve_token()
+        if not token:
+            raise RuntimeError("Telegram bot token missing.")
+        msg = text or "(empty response)"
+        last: dict[str, Any] = {}
+        for i in range(0, len(msg), 4000):
+            last = self._api_call(token, "sendMessage", {"chat_id": chat_id, "text": msg[i : i + 4000]})
+        return last
+
+    def send_streaming_reply(self, token: str, chat_id: Any, reply: str) -> None:
+        """Send an initial Telegram message and progressively edit it to stream the reply."""
+        msg = reply or "(empty response)"
+        first_part = msg[:4000]
+        if len(first_part) <= 180:
+            self._send_chunked(token, chat_id, msg)
+            return
+        step = max(150, len(first_part) // 4)
+        sent = self._api_call(token, "sendMessage", {"chat_id": chat_id, "text": first_part[:step] + " ▌"})
+        msg_id = (sent.get("result") or {}).get("message_id")
+        if not msg_id:
+            if len(msg) > 4000:
+                self._send_chunked(token, chat_id, msg[4000:])
+            return
+        pos = step
+        while pos < len(first_part):
+            time.sleep(0.75)
+            pos = min(len(first_part), pos + step)
+            suffix = " ▌" if pos < len(first_part) else ""
+            try:
+                self._api_call(
+                    token,
+                    "editMessageText",
+                    {"chat_id": chat_id, "message_id": msg_id, "text": first_part[:pos] + suffix},
+                )
+            except Exception:
+                break
+        if len(msg) > 4000:
+            self._send_chunked(token, chat_id, msg[4000:])
+
     def _poll_loop(self, token: str) -> None:
         offset = 0
         while not self._stop_event.is_set():
@@ -347,12 +387,22 @@ class TelegramGateway(BaseGateway):
                     if not (self.is_sender_allowed(sender_id) or (sender_user and self.is_sender_allowed(sender_user))):
                         self._send_chunked(token, chat_id, f"Permission denied for sender '{sender_id}'.")
                         continue
+                    typing_stop = threading.Event()
+
+                    def _tg_typing(cid: Any = chat_id, stop_ev: threading.Event = typing_stop) -> None:
+                        while not stop_ev.is_set():
+                            try:
+                                self._api_call(token, "sendChatAction", {"chat_id": cid, "action": "typing"})
+                            except Exception:
+                                pass
+                            stop_ev.wait(4.5)
+
+                    threading.Thread(target=_tg_typing, daemon=True).start()
                     try:
-                        self._api_call(token, "sendChatAction", {"chat_id": chat_id, "action": "typing"})
-                    except Exception:
-                        pass
-                    reply = self.dispatch_message(sender_id, text)
-                    self._send_chunked(token, chat_id, reply)
+                        reply = self.dispatch_message(sender_id, text)
+                    finally:
+                        typing_stop.set()
+                    self.send_streaming_reply(token, chat_id, reply)
             except Exception as exc:
                 self._detail = f"polling error: {str(exc)[:60]}"
                 time.sleep(2.0)
