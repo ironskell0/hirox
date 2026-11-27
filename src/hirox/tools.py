@@ -209,8 +209,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "properties": {
                     "gateway": {
                         "type": "string",
-                        "enum": ["telegram", "discord", "slack", "whatsapp", "matrix"],
-                        "description": "Target gateway name",
+                        "description": "Target gateway name (e.g. telegram, discord, slack, whatsapp, matrix, irc, twitch, line, feishu, teams, signal, etc.)",
                     },
                     "message": {"type": "string", "description": "Message text to send"},
                     "target": {"type": "string", "description": "Optional chat_id/user_id/channel/phone/room_id (defaults to paired user)"},
@@ -633,7 +632,12 @@ def execute_tool(
             elif gw_name == "matrix":
                 MatrixGateway("matrix", gw_cfg).send_message(target, msg_text)
             else:
-                return f"Error: unsupported gateway '{gw_name}'."
+                from hirox.gateways_extra import EXTRA_GATEWAY_CLASSES
+
+                cls = EXTRA_GATEWAY_CLASSES.get(gw_name)
+                if cls is None or not hasattr(cls, "send_message"):
+                    return f"Error: unsupported gateway '{gw_name}'."
+                cls(gw_name, gw_cfg).send_message(target, msg_text)  # type: ignore[attr-defined]
             return f"Sent message via {gw_name} to {target}."
 
         if name in ("write_file", "edit_file", "rollback_file", "run_command"):

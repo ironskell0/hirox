@@ -87,7 +87,7 @@ class BaseGateway(ABC):
         requires_pairing = bool(
             self.config.get(
                 "require_pairing",
-                self.gateway_type in ("telegram", "discord", "slack", "whatsapp", "matrix"),
+                self.gateway_type not in ("cli", "webhook"),
             )
         )
         if requires_pairing and not is_sender_paired(self.name, sender):
@@ -261,7 +261,7 @@ class WebhookGateway(BaseGateway):
                     self._send_json(200, {"challenge": data.get("challenge", "")})
                     return
 
-                if self.path in (gw.path, "/chat", "/slack/events", "/whatsapp/webhook", "/discord"):
+                if self.path in (gw.path, "/chat", "/slack/events", "/whatsapp/webhook", "/discord") or self.path.startswith("/gw/"):
                     text = str(
                         data.get("message")
                         or data.get("text")
@@ -951,6 +951,9 @@ def build_registry_from_config(
             elif gtype == "matrix":
                 gw = MatrixGateway(name=name, config=gw_cfg, message_handler=message_handler)
             else:
-                gw = CLIGateway(name=name, config=gw_cfg, message_handler=message_handler)
+                from hirox.gateways_extra import EXTRA_GATEWAY_CLASSES
+
+                cls = EXTRA_GATEWAY_CLASSES.get(gtype, CLIGateway)
+                gw = cls(name=name, config=gw_cfg, message_handler=message_handler)
             registry.register(gw)
     return registry
